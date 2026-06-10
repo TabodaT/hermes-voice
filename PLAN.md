@@ -24,6 +24,13 @@
 - WebRTC media transport (won't traverse the Cloudflare quick tunnel; use WebSocket if/when we go sub-second).
 - New profile runtime — we are a *client* to existing profiles.
 
+> **STT caveat (v0.1):** browser `webkitSpeechRecognition` on Android Chrome
+> typically streams microphone audio to Google's servers for transcription — it
+> is **not** self-hosted and you cannot force on-device recognition. So
+> "self-hosted" and "no vendor sees your audio" hold for the *brain and TTS* in
+> v0.1, but **not** for STT. Fully self-hosted STT arrives with the Phase-2
+> faster-whisper path.
+
 ---
 
 ## 2. Why a PWA (not a native app, not Telegram, not WebRTC)
@@ -54,9 +61,9 @@ The single most important correction: **WebRTC and the Cloudflare quick tunnel a
 │  AudioWorklet (later)  │                                  │   profile, OpenAI-compatible)    │
 │   └─ PCM frames        │                                  │     ├─ POST /sessions/.../chat   │
 │                        │                                  │     │   (SSE, streaming tokens)  │
-│  <audio> queue         │                                  │     ├─ GET  /tts?text=…          │
+│  <audio> queue         │                                  │     ├─ GET  /api/tts?text=…      │
 │   └─ per-sentence TTS  │                                  │     │   (Edge TTS, audio/ogg)    │
-│                        │                                  │     ├─ POST /chat/cancel         │
+│                        │                                  │     ├─ POST /api/…/cancel        │
 │  service worker (PWA)  │                                  │     └─ GET  /voice  (static PWA) │
 └────────────────────────┘                                  │                                  │
                                                              │   AIAgent.run_conversation()     │
@@ -67,12 +74,27 @@ The single most important correction: **WebRTC and the Cloudflare quick tunnel a
                                                              └──────────────────────────────────┘
 ```
 
-**Barge-in path (client-side, no server cooperation needed for v0.1):**
-1. While the assistant is speaking, the user starts talking.
-2. `webkitSpeechRecognition.onspeechstart` fires (or first interim `onresult`).
-3. Client calls `audio.pause()` + `speechSynthesis.cancel()` + `AbortController.abort()` on the SSE fetch.
-4. Client POSTs `/chat/cancel` to drop the in-flight generation.
-5. UI shows "interrupted" briefly; assistant can re-engage on the next user utterance.
+**Barge-in path (v0.1 is half-duplex — see the echo note):**
+1. **Push-to-talk:** the mic is only live while the button is held, so *pressing
+   PTT is itself the interrupt*. On `pointerdown` the client aborts any in-flight
+   SSE, pauses and clears the audio queue, and POSTs `/api/sessions/.../cancel`.
+2. **Hands-free:** the recognizer is paused while the assistant is speaking and
+   resumes when the audio queue drains. This avoids the echo loop below; the cost
+   is that you cannot barge in *by voice* mid-sentence in hands-free — tap the
+   screen (or use PTT) to interrupt.
+3. On interrupt the client calls `audio.pause()` + `AbortController.abort()` on
+   the SSE fetch. (We play server TTS through an `<audio>` element, **not** the
+   browser `speechSynthesis` API, so there is no `speechSynthesis.cancel()`.)
+4. Client POSTs `/api/sessions/.../cancel` to drop the in-flight generation
+   server-side, then awaits it before opening the next chat (see the cancel-race
+   fix in §6.4).
+5. UI shows "interrupted" briefly; the assistant re-engages on the next utterance.
+
+> **Echo / self-barge-in (the hard one):** the Web Speech API exposes no
+> acoustic echo cancellation, so an open mic on a phone in speaker mode hears the
+> assistant's own TTS and would interrupt itself. v0.1 sidesteps this with
+> half-duplex (mic off while speaking). True full-duplex voice barge-in needs
+> server-side VAD + AEC and is a Phase-2 item.
 
 The "interrupt mid-tool-call" edge case is acknowledged but deferred: cancelling a half-executed tool call is genuinely hard; the current tool call completes, then the loop notices the cancel token and exits cleanly.
 
@@ -162,15 +184,28 @@ const API_BASE = '';                 // same origin (served by Hermes /voice)
 const sessionId = crypto.randomUUID();
 let profile = 'coder';
 
+// Token: the PWA is served from the open /voice path, but every /api/* call
+// (chat, tts, cancel) needs the shared token. Store it once in localStorage.
+// The <audio> element can't set headers, so /api/tts gets it as a ?token= param.
+let TOKEN = localStorage.getItem('axiToken') || '';
+function ensureToken() {
+  if (!TOKEN) {
+    TOKEN = (prompt('Hermes voice token') || '').trim();
+    if (TOKEN) localStorage.setItem('axiToken', TOKEN);
+  }
+  return TOKEN;
+}
+
 // ─── DOM ────────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
 const transcript = $('transcript');
 const ptt = $('ptt');
-const status = $('status');
+const statusEl = $('status');
 const profileSel = $('profile');
 const handsfree = $('handsfree');
 
 profileSel.onchange = () => (profile = profileSel.value);
+function setStatus(s) { statusEl.textContent = s; }
 
 // ─── transcript helpers ─────────────────────────────────────────────────────
 function addLine(role, text) {
@@ -182,27 +217,50 @@ function addLine(role, text) {
   return el;
 }
 
-// ─── STT (browser, streaming via webkitSpeechRecognition) ───────────────────
+// ─── speakable text (strip markdown/code so TTS doesn't read symbols) ────────
+// The coder profile emits code fences, backticks, JSON and URLs; reading those
+// aloud verbatim is unusable. Flatten to something a voice can actually speak.
+function speakable(text) {
+  const FENCE = '`{3}';   // matches a code fence; built via string, not a literal, so it can't close this block
+  return text
+    .replace(new RegExp(FENCE + '[\\s\\S]*?' + FENCE, 'g'), ' (code block) ')  // fenced code
+    .replace(/`([^`]+)`/g, '$1')                      // inline code
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')        // links/images -> label
+    .replace(/https?:\/\/\S+/g, ' link ')             // bare URLs
+    .replace(/[*_#>~|]+/g, ' ')                        // markdown markup
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ─── half-duplex flag: the mic is muted while the assistant is speaking ──────
+let assistantSpeaking = false;   // audio is (or is about to be) playing
+let responseStreaming = false;   // tokens are still arriving for this turn
+
+// ─── STT (browser, streaming via webkitSpeechRecognition) ────────────────────
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recognizer = null;
-let srAbort = null;
+let recognizerActive = false;
 
 function startRecognizer() {
-  if (!SR) { setStatus('STT unsupported in this browser'); return null; }
-  recognizer = new SR();
-  recognizer.continuous = true;
-  recognizer.interimResults = true;
-  recognizer.lang = 'en-US';
+  if (!SR) { setStatus('STT unsupported in this browser'); return; }
+  if (recognizerActive || assistantSpeaking) return;  // guard double-start / echo
+  const r = new SR();
+  recognizer = r;
+  r.continuous = true;
+  r.interimResults = true;
+  r.lang = 'en-US';
 
   let interim = '';
   let finalBuf = '';
 
-  recognizer.onresult = (ev) => {
+  r.onstart = () => { recognizerActive = true; };
+  r.onresult = (ev) => {
+    if (assistantSpeaking) return;          // ignore echo of our own TTS
     interim = '';
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const r = ev.results[i];
-      if (r.isFinal) finalBuf += r[0].transcript;
-      else interim += r[0].transcript;
+      const res = ev.results[i];
+      if (res.isFinal) finalBuf += res[0].transcript;
+      else interim += res[0].transcript;
     }
     if (interim) setStatus(`hearing: ${interim.trim().slice(0, 60)}…`);
     if (finalBuf) {
@@ -211,50 +269,69 @@ function startRecognizer() {
       if (text) sendUtterance(text);
     }
   };
-  recognizer.onerror = (e) => { console.warn('SR error', e); };
-  recognizer.onend = () => { if (handsfree.checked) recognizer.start(); };
+  r.onerror = (e) => { console.warn('SR error', e.error || e); };
+  r.onend = () => {
+    recognizerActive = false;
+    // Auto-restart only in hands-free, and only while we're not speaking.
+    if (handsfree.checked && !assistantSpeaking) {
+      try { r.start(); } catch { /* retry on next onend */ }
+    }
+  };
 
-  recognizer.start();
-  return recognizer;
+  try { r.start(); } catch (e) { console.warn('SR start failed', e); }
 }
 
 function stopRecognizer() {
-  recognizer?.stop();
+  recognizerActive = false;
+  try { recognizer?.stop(); } catch { /* ignore */ }
   recognizer = null;
 }
 
-// ─── LLM streaming + per-sentence TTS playback ──────────────────────────────
+// ─── LLM streaming + per-sentence TTS playback ───────────────────────────────
 let inflightAbort = null;
-const audioQueue = [];
+const audioQueue = [];     // holds *preloaded* HTMLAudioElement objects (prefetch)
 let audioEl = null;
 
-function setStatus(s) { status.textContent = s; }
+// Cancel the PREVIOUS response: abort the local SSE read first, then tell the
+// server to drop generation, and await it so a stale cancel can't race the new
+// chat (the chat endpoint also clears its own flag at start — see §6.4).
+async function cancelInflight() {
+  const had = !!inflightAbort || !!audioEl || audioQueue.length > 0;
+  if (inflightAbort) { inflightAbort.abort(); inflightAbort = null; }
+  for (const a of audioQueue) { try { a.pause(); } catch {} }
+  audioQueue.length = 0;
+  if (audioEl) { try { audioEl.pause(); } catch {} audioEl = null; }
+  assistantSpeaking = false;
+  if (!had) return;
+  try {
+    await fetch(`${API_BASE}/api/sessions/${sessionId}/cancel?profile=${profile}`,
+      { method: 'POST', headers: { 'x-axi-token': ensureToken() } });
+  } catch { /* best-effort */ }
+}
 
 async function sendUtterance(text) {
-  // Barge-in: cancel any in-flight response before starting a new one.
-  if (inflightAbort) { inflightAbort.abort(); inflightAbort = null; }
-  if (audioEl) { audioEl.pause(); audioEl = null; }
-  audioQueue.length = 0;
+  await cancelInflight();                  // barge-in: drop the previous turn first
 
   addLine('user', text);
   const assistantEl = addLine('assistant', '');
 
   inflightAbort = new AbortController();
+  responseStreaming = true;
   let acc = '';
   let sentenceBuf = '';
 
   try {
     const r = await fetch(`${API_BASE}/api/sessions/${sessionId}/chat?profile=${profile}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+        'x-axi-token': ensureToken(),
+      },
       body: JSON.stringify({ message: text, stream: true }),
       signal: inflightAbort.signal,
     });
     if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
-
-    // Best-effort cancel ping (server may ignore if no cancel token yet).
-    fetch(`${API_BASE}/api/sessions/${sessionId}/cancel?profile=${profile}`,
-      { method: 'POST' }).catch(() => {});
 
     const reader = r.body.getReader();
     const dec = new TextDecoder();
@@ -278,16 +355,19 @@ async function sendUtterance(text) {
           acc += piece;
           assistantEl.textContent = acc;
           sentenceBuf += piece;
-          // Sentence boundary -> enqueue TTS.
-          if (/[.!?…]\s/.test(sentenceBuf)) {
-            const s = sentenceBuf.trim();
-            sentenceBuf = '';
-            if (s) enqueueTts(s);
+          // Sentence boundary: punctuation + space + a capital/quote/digit, and a
+          // min length, so "v0.1 ", "e.g. " and "1.5 s" don't split mid-thought.
+          const m = sentenceBuf.match(/^[\s\S]*?[.!?…]["')\]]?\s+(?=[A-Z0-9"'(])/);
+          if (m && m[0].trim().length > 12) {
+            const spoken = speakable(m[0]);
+            sentenceBuf = sentenceBuf.slice(m[0].length);
+            if (spoken) enqueueTts(spoken);
           }
         } catch { /* ignore non-JSON frames */ }
       }
     }
-    if (sentenceBuf.trim()) enqueueTts(sentenceBuf.trim());
+    const tail = speakable(sentenceBuf);
+    if (tail) enqueueTts(tail);
   } catch (e) {
     if (e.name !== 'AbortError') {
       console.error(e);
@@ -295,34 +375,53 @@ async function sendUtterance(text) {
     }
   } finally {
     inflightAbort = null;
+    responseStreaming = false;
+    if (!audioEl && !audioQueue.length && handsfree.checked) startRecognizer();
   }
 }
 
+// Prefetch: build the Audio element (which starts buffering immediately) the
+// moment a sentence is ready, so clip N+1 downloads while clip N is playing.
 function enqueueTts(text) {
-  audioQueue.push(text);
+  const url = `${API_BASE}/api/tts?text=${encodeURIComponent(text)}`
+            + `&profile=${profile}&token=${encodeURIComponent(ensureToken())}`;
+  const a = new Audio();
+  a.preload = 'auto';
+  a.src = url;
+  audioQueue.push(a);
   if (!audioEl) playNext();
 }
 
 function playNext() {
-  if (!audioQueue.length) { audioEl = null; return; }
-  const text = audioQueue.shift();
-  const url = `${API_BASE}/tts?text=${encodeURIComponent(text)}&profile=${profile}`;
-  const a = new Audio(url);
+  const a = audioQueue.shift();
+  if (!a) {
+    audioEl = null;
+    assistantSpeaking = false;
+    // Resume listening only once the turn is fully done (queue drained + stream
+    // closed), so an inter-sentence gap doesn't reopen the mic mid-response.
+    if (handsfree.checked && !responseStreaming) startRecognizer();
+    return;
+  }
   audioEl = a;
+  assistantSpeaking = true;
+  stopRecognizer();           // half-duplex: don't listen to ourselves
   a.onended = playNext;
   a.onerror = playNext;
   a.play().catch(playNext);
 }
 
-// ─── PTT button + hands-free toggle ─────────────────────────────────────────
-ptt.addEventListener('pointerdown', () => startRecognizer());
+// ─── PTT button + hands-free toggle ──────────────────────────────────────────
+// Pressing PTT is itself the interrupt: cancel anything in flight, then listen.
+ptt.addEventListener('pointerdown', () => { cancelInflight(); startRecognizer(); });
 ptt.addEventListener('pointerup',   () => stopRecognizer());
 ptt.addEventListener('pointerleave', () => stopRecognizer());
 handsfree.onchange = () => { if (handsfree.checked) startRecognizer(); else stopRecognizer(); };
 
-// Initial mic prompt on first interaction.
+// First user gesture: prime the token (and the mic, if hands-free).
+// getUserMedia / SpeechRecognition both require a user gesture + secure origin.
 document.addEventListener('pointerdown', function once() {
   document.removeEventListener('pointerdown', once);
+  ensureToken();
   if (handsfree.checked) startRecognizer();
 });
 ```
@@ -348,17 +447,23 @@ document.addEventListener('pointerdown', function once() {
 `client/sw.js` (offline shell — install the PWA so the home-screen launch is snappy):
 
 ```js
-const CACHE = 'axi-v1';
+const CACHE = 'axi-v2';
 const SHELL = ['/voice/', '/voice/app.js', '/voice/style.css', '/voice/manifest.webmanifest'];
 self.addEventListener('install', (e) => e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL))));
 self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', (e) => {
-  if (e.request.method !== 'GET') return;
+  const url = new URL(e.request.url);
+  // Cache only the static app shell. NEVER cache /api/* — chat is a one-shot SSE
+  // stream and /api/tts URLs are unique per sentence (the cache would grow without
+  // bound and could replay stale audio).
+  if (e.request.method !== 'GET' || url.pathname.startsWith('/api/')) return;
   e.respondWith(
     caches.match(e.request).then(hit => hit ||
       fetch(e.request).then(res => {
-        const copy = res.clone();
-        caches.open(CACHE).then(c => c.put(e.request, copy)).catch(() => {});
+        if (url.origin === location.origin && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE).then(c => c.put(e.request, copy)).catch(() => {});
+        }
         return res;
       }).catch(() => hit))
   );
@@ -380,7 +485,9 @@ unapplied with `git apply -R`. No fork required for v0.1.
 api_server:
   enabled: true
   host: 127.0.0.1
-  port: 8642          # coder -> 8642, scout -> 8643, vector -> 8644, banel -> 8645
+  port: 8642          # per-profile: coder 8642, scout 8643, vector 8644, banel 8645
+                      # the phase-1.5 profile router (§7) runs SEPARATELY on 8640
+                      # and fronts all of these — never reuse a profile's port for it
   voice_path: /voice  # serves the PWA static files
   require_token: true
   access_token: ${HERMES_VOICE_TOKEN}   # a long random string in .env
@@ -390,14 +497,22 @@ api_server:
 
 ```python
 # ─── additions only; merge into the existing FastAPI app ──────────────────
-import os, re, asyncio
+import os
 from fastapi import APIRouter, HTTPException, Request, Query
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, Response
 
 router = APIRouter()
 TOKEN = os.environ["HERMES_VOICE_TOKEN"]
 
-# 1) Auth gate (applied to the router, NOT to /voice or /tts or /health)
+# Static client dir, resolved ONCE and reused as the traversal jail below.
+CLIENT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "hermes-voice", "client")
+)
+
+# 1) Auth gate. Everything under /api/* needs the token (header or ?token=).
+#    /voice (the PWA shell) and /health stay open. NOTE: /api/tts lives INSIDE
+#    the gate on purpose — it spawns synthesis and must not be a free, public,
+#    abusable endpoint once the tunnel makes the box reachable.
 @router.middleware("http")
 async def _auth(request: Request, call_next):
     if not request.url.path.startswith("/api/"):
@@ -407,27 +522,32 @@ async def _auth(request: Request, call_next):
         raise HTTPException(status_code=401, detail="bad token")
     return await call_next(request)
 
-# 2) Serve the PWA at /voice
+# 2) Serve the PWA at /voice (open — it's just the static shell)
 @router.get("/voice")
 @router.get("/voice/{path:path}")
 async def voice(path: str = ""):
-    root = os.path.join(os.path.dirname(__file__), "..", "..", "..", "hermes-voice", "client")
-    full = os.path.normpath(os.path.join(root, path or "index.html"))
-    if not full.startswith(os.path.abspath(root)):
+    full = os.path.abspath(os.path.join(CLIENT_ROOT, path or "index.html"))
+    # Reject traversal: the resolved path must stay inside CLIENT_ROOT. Compare
+    # absolute-vs-absolute via commonpath (the old startswith(abspath) check
+    # mixed a relative `full` with an absolute root and silently 404'd).
+    if os.path.commonpath([full, CLIENT_ROOT]) != CLIENT_ROOT:
         raise HTTPException(404)
     if os.path.isdir(full):
         full = os.path.join(full, "index.html")
-    if not os.path.exists(full):
+    if not os.path.isfile(full):
         raise HTTPException(404)
     media = "text/html" if full.endswith(".html") else None
     return FileResponse(full, media_type=media)
 
-# 3) TTS proxy (wraps the existing text_to_speech_tool)
-@router.get("/tts")
+# 3) TTS — UNDER /api/ so the auth gate covers it. The <audio> element can't set
+#    headers, so the client passes the token as ?token=. Rate-limit per session
+#    (see §9). synthesize() is async (edge-tts streams), so await it directly —
+#    do NOT wrap an async fn in asyncio.to_thread (that returns an un-awaited
+#    coroutine, not bytes).
+@router.get("/api/tts")
 async def tts(text: str = Query(..., max_length=2000), profile: str = "coder"):
-    # Delegate to the same TTS code path the Telegram voice-note path uses.
     from hermes_voice.tts_bridge import synthesize  # tiny shim, see 6.3
-    audio = await asyncio.to_thread(synthesize, text, profile)
+    audio = await synthesize(text, profile)
     return Response(content=audio, media_type="audio/ogg")
 
 # 4) Cancel an in-flight response (best-effort; the agent loop notices the token)
@@ -437,7 +557,7 @@ async def cancel(sid: str, profile: str = "coder"):
     request_cancel(profile, sid)
     return {"ok": True}
 
-# 5) Health
+# 5) Health (open)
 @router.get("/health")
 async def health():
     return {"ok": True}
@@ -448,8 +568,8 @@ async def health():
 ```python
 """Bridge to the existing Hermes TTS path. Replace the import with the real
 text-to-speech tool used by the Telegram gateway (edge-tts, ElevenLabs, …).
+Kept async because edge-tts streams; the /api/tts endpoint awaits it directly.
 """
-import asyncio
 from .config import load_profile
 
 async def synthesize(text: str, profile: str) -> bytes:
@@ -492,8 +612,14 @@ def clear(profile: str, session_id: str) -> None:
         _flags.get(profile, set()).discard(session_id)
 ```
 
-The agent loop should call `is_cancelled()` at the top of each tool iteration
-and `clear()` when the loop exits (any branch).
+Cancel-race contract (so a stale flag never kills a fresh turn):
+- The **chat** endpoint calls `clear(profile, session_id)` at the **start** of a
+  new generation — before the first token — so a leftover cancel flag from the
+  previous turn can't abort the new response.
+- The agent loop calls `is_cancelled()` at the top of each tool iteration and
+  `clear()` again when the loop exits (any branch).
+- The **client** awaits the cancel POST before opening the next chat (see
+  `cancelInflight()` in §5), so the cancel and the new request can't reorder.
 
 ---
 
@@ -504,50 +630,72 @@ that fronts them all on a single port and dispatches by `?profile=` query param
 or `X-Hermes-Profile` header. The router is ~80 lines of Python and runs as a
 standalone process; cloudflared points at the router's port.
 
+The router gets its **own** port (8640). It must NOT reuse a profile's port — a
+process can't bind a port another process already holds, and forwarding to your
+own address loops. coder/scout/vector/banel keep 8642–8645 (matching §6.1).
+
 ```
-phone ──► cloudflared ──► :8642  (profile router)
+phone ──► cloudflared ──► :8640  (profile router)
                             │
                             ├─ coder  :8642  (real api_server.py)
-                            ├─ scout   :8653
-                            ├─ vector  :8654
-                            └─ banel   :8655
+                            ├─ scout  :8643
+                            ├─ vector :8644
+                            └─ banel  :8645
 ```
 
-`server/profile_router.py` (sketch — the real one is a thin aiohttp/Starlette proxy):
+`server/profile_router.py` (sketch — a thin Starlette + httpx streaming proxy):
 
 ```python
+from contextlib import asynccontextmanager
 from starlette.applications import Starlette
-from starlette.responses import Response, JSONResponse
+from starlette.requests import Request
+from starlette.responses import StreamingResponse, JSONResponse
 from starlette.routing import Route
+from starlette.background import BackgroundTask
 import httpx
 
 PROFILES = {
     "coder":  "http://127.0.0.1:8642",
-    "scout":  "http://127.0.0.1:8653",
-    "vector": "http://127.0.0.1:8654",
-    "banel":  "http://127.0.0.1:8655",
+    "scout":  "http://127.0.0.1:8643",
+    "vector": "http://127.0.0.1:8644",
+    "banel":  "http://127.0.0.1:8645",
 }
+
+# Hop-by-hop headers must not be forwarded (RFC 7230 §6.1) or they corrupt the
+# proxied response (notably content-length / transfer-encoding on a stream).
+HOP = {b"connection", b"keep-alive", b"transfer-encoding", b"te", b"trailer",
+       b"upgrade", b"proxy-authorization", b"proxy-authenticate", b"host"}
+
+client = httpx.AsyncClient(timeout=None)   # one reused client, closed on shutdown
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    await client.aclose()
 
 async def proxy(request: Request):
     profile = request.query_params.get("profile") or request.headers.get("x-hermes-profile", "coder")
     if profile not in PROFILES:
         return JSONResponse({"error": "unknown profile"}, status_code=400)
-    target = PROFILES[profile]
-    # Strip the profile selector before forwarding.
-    url = httpx.URL(path=request.url.path, query=request.url.query.decode())
-    upstream = httpx.URL(f"{target}{url.path}?{url.query.decode()}")
+    upstream = f"{PROFILES[profile]}{request.url.path}"
+    headers = [(k, v) for k, v in request.headers.raw if k.lower() not in HOP]
     body = await request.body()
-    r = await httpx.AsyncClient().request(
-        request.method, str(upstream),
-        headers={k: v for k, v in request.headers.raw if k != b"host"},
-        content=body, timeout=None,
-    )
-    return Response(r.content, status_code=r.status_code, headers=dict(r.headers))
+    # STREAM the upstream response — never `await r.content` / buffer it, or the
+    # SSE token stream gets collected in full before the phone sees a single token
+    # and "time to first voice" balloons to the length of the whole answer.
+    req = client.build_request(request.method, upstream,
+                               params=request.query_params, headers=headers, content=body)
+    r = await client.send(req, stream=True)
+    resp_headers = {k.decode(): v.decode() for k, v in r.headers.raw if k.lower() not in HOP}
+    return StreamingResponse(r.aiter_raw(), status_code=r.status_code,
+                             headers=resp_headers, background=BackgroundTask(r.aclose))
 
-app = Starlette(routes=[Route("/{path:path}", proxy), Route("/", proxy)])
+app = Starlette(lifespan=lifespan,
+                routes=[Route("/{path:path}", proxy, methods=["GET", "POST"]),
+                        Route("/", proxy, methods=["GET", "POST"])])
 ```
 
-Run with `uvicorn profile_router:app --host 127.0.0.1 --port 8642`.
+Run with `uvicorn profile_router:app --host 127.0.0.1 --port 8640`.
 
 ---
 
@@ -559,7 +707,9 @@ Run with `uvicorn profile_router:app --host 127.0.0.1 --port 8642`.
 # deploy/cloudflared-quick.sh
 #!/usr/bin/env bash
 set -euo pipefail
-exec /home/octa/.local/bin/cloudflared tunnel --url http://127.0.0.1:8642
+# Point at the profile router (§7). For a Phase-1 single-profile trial with no
+# router yet, use the coder api_server directly: http://127.0.0.1:8642
+exec /home/octa/.local/bin/cloudflared tunnel --url http://127.0.0.1:8640
 ```
 
 URL rotates on every run. Fine for development, painful for a home-screen PWA.
@@ -583,12 +733,13 @@ Stable URL, no auth prompts, survives restarts. Drop a systemd unit in
 
 ## 9. Security checklist (do not skip)
 
-- [ ] **Auth token on every `/api/*` call.** The tunnel makes the server public; the token is the only thing between the world and your agent's tool loop.
+- [ ] **Auth token on every `/api/*` call — including `/api/tts`.** The tunnel makes the server public; the token is the only thing between the world and your agent's tool loop. `/api/tts` is deliberately inside the gate (it spawns synthesis); only `/voice` (static shell) and `/health` are open.
 - [ ] **HTTPS only.** `getUserMedia` / `SpeechRecognition` require a secure origin. The Cloudflare URL is HTTPS; `http://localhost` from the phone will not work.
-- [ ] **No loopback exposure.** API server binds to `127.0.0.1`, only the tunnel reaches it.
-- [ ] **Rate limit the chat endpoint.** One short message per second per session is plenty for a single user; reject anything bursty.
-- [ ] **Token rotation.** A button in the PWA to rotate the token; the old one is invalidated server-side.
+- [ ] **No loopback exposure.** API server (and the router) bind to `127.0.0.1`; only the tunnel reaches them.
+- [ ] **Rate limit the chat *and* TTS endpoints.** One short message per second per session is plenty for a single user; reject anything bursty. `/api/tts` especially — it's a free synthesis box otherwise.
+- [ ] **Token rotation.** A button in the PWA to rotate the token; the old one is invalidated server-side (and the client's `localStorage` copy is replaced).
 - [ ] **Audit log.** Append every `/api/sessions/.../chat` call (text only, no audio) to a local log for later review.
+- [ ] **Browser STT sends audio to Google.** In v0.1 `webkitSpeechRecognition` transcribes via Google's servers — your spoken audio leaves the box even though the brain and TTS don't. If that's unacceptable, wait for the Phase-2 faster-whisper path (fully local STT).
 - [ ] **No STT/TTS logging at the vendor.** Edge TTS already does not log; if you swap to a paid TTS provider, turn off their training-data opt-in.
 
 Full version: `docs/security.md`.
@@ -603,8 +754,14 @@ Full version: `docs/security.md`.
 | Transcript → first token | SSE from Hermes | 300–600 ms (minimax-m3 TTFB) |
 | First token → first audio | Edge TTS, per-sentence | 300–500 ms |
 | **Time to first voice** | | **~0.8–1.5 s** |
-| Subsequent sentences | overlap TTS fetch with token stream | 200–400 ms per sentence |
+| Subsequent sentences | client prefetches clip N+1 while clip N plays (§5 `enqueueTts`) | 200–400 ms per sentence |
 | Barge-in (cancel) | client-side `audio.pause()` + SSE abort | <50 ms perceived |
+
+> The prefetch matters: without it (`new Audio(url)` only on the *previous*
+> clip's `onended`) each sentence pays the full ~300–500 ms synth latency
+> serially, leaving an audible gap between sentences. The §5 reference code
+> builds the next `Audio` element as soon as the sentence is ready so the fetch
+> overlaps playback.
 
 Where to shave it later (Phase 2):
 - Local TTS (Kokoro-82M) drops first-audio to 80–150 ms.
@@ -623,12 +780,13 @@ Full version: `docs/latency-budget.md`.
 3. Drop `client/` next to the Hermes checkout (or symlink).
 4. `uvicorn` (or the existing runner) starts the API server on `:8642`.
 5. `cloudflared tunnel --url http://127.0.0.1:8642` for first try.
-6. Open the printed URL on the phone, install the PWA, talk.
-7. **Verify:** utterance → first voice under 1.5 s; barge-in works.
+6. Open the printed URL on the phone, paste the token once when prompted, install the PWA, talk.
+7. **Verify:** utterance → first voice under 1.5 s; PTT interrupt works (hands-free is half-duplex — mic pauses while the assistant speaks).
 
 ### Phase 1.5 — Per-profile (≈½ day)
-1. Apply config to scout/vector/banel; pick distinct ports.
-2. Stand up `server/profile_router.py` on `:8642`.
+1. Apply config to scout/vector/banel on distinct ports (8643/8644/8645).
+2. Stand up `server/profile_router.py` on `:8640` (its own port — not a
+   profile's), and repoint cloudflared at `:8640`.
 3. Add the `?profile=` selector to the PWA header.
 
 ### Phase 2 — WebSocket streaming pipeline (≈1–2 wks, optional)
@@ -645,9 +803,11 @@ support, accessibility audit, named tunnel + stable hostname.
 
 ## 12. Open questions
 
-- **Per-profile ports vs. one router port?** v0.1 ships the router; profile-direct stays as a fallback.
+- **Per-profile ports vs. one router port?** v0.1 ships the router on its own port (8640) in front of profiles on 8642–8645; profile-direct stays as a fallback.
+- **Full-duplex voice barge-in?** Deferred to Phase 2. v0.1 is half-duplex (mic off while speaking) because the Web Speech API has no echo cancellation; true voice interruption needs server-side VAD + AEC.
 - **Cancel mid-tool-call?** Acknowledged as best-effort. Decide whether to surface a "stopping…" indicator while the current tool completes.
 - **Audio format for TTS?** Edge TTS gives us `audio/ogg` (`opus`). All Android Chrome versions play it. If iOS is ever needed, switch the TTS bridge to `audio/mpeg`.
+- **Token onboarding/rotation?** v0.1 prompts once and caches the token in `localStorage`. Rotation must invalidate it server-side and force a re-prompt on the client.
 - **Session persistence?** v0.1 generates a session id per tab and forgets on reload. Add `localStorage` later.
 
 ---
